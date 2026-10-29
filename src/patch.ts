@@ -348,6 +348,33 @@ const SETTINGS_FROM = 'connection.isLoopback ? "host" : "memory"';
 const SETTINGS_ALPHA_FROM = 'ctx.remote.$host.isLoopback ? "host" : "memory"';
 const SETTINGS_TO = '"host"';
 
+type SettingsMode = 'patched' | 'native' | 'unsupported';
+
+function settingsModeForFile(file: string, dshVersion: string | null): SettingsMode {
+  const source = readFileSync(file, 'utf8');
+  if (source.includes(SETTINGS_FROM) || source.includes(SETTINGS_ALPHA_FROM)) return 'unsupported';
+  // A stray "host" label does not prove that the legacy persistence is patched.
+  if (/\bconst\s+(?:persistence|mode)\s*=\s*"host"\s*;/.test(source)) return 'patched';
+
+  // rc.2 removed browser-local persistence entirely. Recognize the reviewed
+  // package identity AND mirror contract; an absent old anchor alone proves nothing.
+  const packageVersion = readPackageVersion(path.join(path.dirname(path.dirname(file)), 'package.json'));
+  if (dshVersion?.split('+')[0] !== '0.2.1-rc.2' || packageVersion?.split('+')[0] !== '0.2.1-rc.2') {
+    return 'unsupported';
+  }
+  const nativeContract = [
+    /\bSettingsDescribeMirror\s*=\s*class\b/,
+    /await\s+this\.ctx\.remote\.settings\.describe\(\)/,
+    /response\.ok\s*\?\s*\{\s*view:\s*response\.value\s*\}/,
+    /const\s+inject\s*=\s*\[\s*"remote"\s*,\s*"remote\.settings"\s*\]/,
+    /new\s+SettingsDescribeMirror\(ctx\)/,
+    /ctx\.remote\.\$on\("settings\/document-updated"/,
+    /ctx\.on\("connection\/reset"/,
+    /mirror\.ensure\(\)/,
+  ];
+  return nativeContract.every((anchor) => anchor.test(source)) ? 'native' : 'unsupported';
+}
+
 // dsh 上游行为：搜索 query 非空时点击侧栏外只 blur 不收起——无结果时
 // 「无匹配会话」死状态会永久滞留侧栏（打开设置/卡片等任何点击都无法消除，
 // 只能手动按 Esc/X）。子补丁：无结果（ready/error 且 0 条）时点击别处自动清空并收起。
@@ -487,7 +514,7 @@ export function patchStatus(
   profileDir = '',
 ): {
   settingsHostMode: boolean;
-
+  settingsMode: SettingsMode;
   workspaceSearch: boolean;
   bindAll: boolean;
   connectionCookieBridge: 'patched' | 'native' | 'missing' | 'unsupported';
@@ -495,14 +522,15 @@ export function patchStatus(
   const settingsFiles = findDshBundleFiles(dshRoot, SETTINGS_PACKAGE, SETTINGS_FILE, profileDir);
   const wsFiles = findDshBundleFiles(dshRoot, WORKSPACE_PACKAGE, WORKSPACE_FILE, profileDir);
   let settingsHostMode = false;
+  let settingsMode: SettingsMode = 'unsupported';
   let workspaceSearch = false;
   let connectionCookieBridge: 'patched' | 'native' | 'missing' | 'unsupported' = 'missing';
   try {
     if (settingsFiles.length === 0) throw new Error('settings bundle not found');
-    settingsHostMode = settingsFiles.every((settingsFile) => {
-      const s = readFileSync(settingsFile, 'utf8');
-      return !s.includes(SETTINGS_FROM) && !s.includes(SETTINGS_ALPHA_FROM) && s.includes(SETTINGS_TO);
-    });
+    const dshVersion = readPackageVersion(path.join(dshRoot, 'package.json'));
+    const modes = settingsFiles.map((file) => settingsModeForFile(file, dshVersion));
+    settingsHostMode = modes.every((mode) => mode !== 'unsupported');
+    if (settingsHostMode) settingsMode = modes.includes('native') ? 'native' : 'patched';
   } catch { /* 文件缺失按未打处理 */ }
 
   try {
@@ -554,7 +582,7 @@ export function patchStatus(
   } catch {
     bindAll = false;
   }
-  return { settingsHostMode, workspaceSearch, bindAll, connectionCookieBridge };
+  return { settingsHostMode, settingsMode, workspaceSearch, bindAll, connectionCookieBridge };
 }
 
 /** 应用补丁（幂等）：返回 'applied'（本次有改动）或 'unchanged' 或 'missing'（目标文件不在） */

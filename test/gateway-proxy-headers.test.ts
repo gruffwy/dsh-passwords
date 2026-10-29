@@ -5660,6 +5660,58 @@ test('权限：0.1.7 changes.open 的 GET/POST 都按会话归属校验', async 
   }
 });
 
+test('权限：Office 预览只开放已知 HTTP 方法，render 必须绑定授权会话和目录', async () => {
+  const fixture = await authorizedSubuserFixture('office-preview-user');
+  const headers = { 'content-type': 'application/json', cookie: fixture.cookie };
+  const envelope = (method: string, args: Record<string, unknown>) => JSON.stringify({
+    type: 'client-request', rpcId: 'office-preview', method, payload: { args },
+  });
+  const renderArgs = { workspaceFileScopeId: 'session-visible', path: 'report.docx', priority: 'foreground' };
+  try {
+    assert.equal((await gatewayReq('POST', '/api/officeToPdf/generation', headers, envelope('officeToPdf/generation', {}))).status, 200);
+    for (const route of ['/api/officeToPdf/render', '/api/officeToPdf.render']) {
+      for (const target of ['report.docx', '/workspaces/visible/report.docx']) {
+        assert.equal((await gatewayReq('POST', route, headers, envelope('officeToPdf/render', { ...renderArgs, path: target }))).status, 200);
+        assert.ok(lastUpstreamUrl.startsWith(route));
+      }
+    }
+    for (const args of [
+      { ...renderArgs, workspaceFileScopeId: 'session-hidden' },
+      { ...renderArgs, path: '../hidden/report.docx' },
+      { ...renderArgs, path: '/workspaces/hidden/report.docx' },
+      { ...renderArgs, path: '' },
+      { ...renderArgs, path: 'bad\0.docx' },
+      { ...renderArgs, priority: 'unknown' },
+      { ...renderArgs, relativePath: '/workspaces/hidden/report.docx' },
+      { path: 'report.docx', priority: 'foreground' },
+    ]) {
+      const before = lastUpstreamUrl;
+      assert.equal((await gatewayReq('POST', '/api/officeToPdf/render', headers, envelope('officeToPdf/render', args))).status, 403);
+      assert.equal(lastUpstreamUrl, before, 'Rejected Office input must not reach upstream');
+    }
+    for (const [route, body] of [
+      ['/api/officeToPdf/generation', envelope('officeToPdf/render', renderArgs)],
+      ['/api/officeToPdf/generation', envelope('officeToPdf/generation', renderArgs)],
+      ['/api/officeToPdf/render', envelope('officeToPdf/generation', {})],
+      ['/api/officeToPdf/render', JSON.stringify(renderArgs)],
+      ['/api/officeToPdf/renderExtra', envelope('officeToPdf/renderExtra', renderArgs)],
+      ['/api/officeToPdf', envelope('officeToPdf/render', renderArgs)],
+    ]) {
+      assert.equal((await gatewayReq('POST', route, headers, body)).status, 403);
+    }
+    assert.equal((await gatewayReq('GET', '/api/officeToPdf/render', headers)).status, 403);
+    remoteMuxOpenEndpoints = [];
+    fixture.connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'office-unary-over-mux', endpoint: 'officeToPdf/render', payload: { args: renderArgs },
+    }));
+    const rejected = await nextFrameOrFail(fixture.connection, 'Office unary mux rejection');
+    assert.equal(rejected.type, 'error');
+    assert.equal(remoteMuxOpenEndpoints.includes('officeToPdf/render'), false);
+  } finally {
+    fixture.connection.client.close();
+  }
+});
+
 test('权限：workspaceFiles/readBytes 的 options.baseFile 与 path 同口径 fail-closed', async () => {
   const fixture = await authorizedSubuserFixture('readBytes-basefile-user');
   const originalCookie = cookie;
@@ -5970,6 +6022,15 @@ test('权限：workspaceFiles 目标路径同时按词法与 canonical 口径判
     const escaped = await read(`${rootPath}/escape/secret.txt`);
     assert.equal(escaped.status, 403, escaped.body);
     assert.equal(lastUpstreamUrl, escapedBefore, '经符号链接逃逸的读取不得到达上游');
+    const preview = (target: string) => gatewayReq('POST', '/api/officeToPdf/render',
+      { 'content-type': 'application/json', cookie: subCookie }, JSON.stringify({
+        type: 'client-request', rpcId: 'office-canonical', method: 'officeToPdf/render',
+        payload: { args: { workspaceFileScopeId: 'session-visible', path: target, priority: 'foreground' } },
+      }));
+    assert.equal((await preview(`${rootPath}/inside.txt`)).status, 200);
+    const previewBefore = lastUpstreamUrl;
+    assert.equal((await preview(`${rootPath}/escape/secret.txt`)).status, 403);
+    assert.equal(lastUpstreamUrl, previewBefore, 'Office 预览不能经符号链接跳出授权目录');
   } finally {
     remoteMuxBaselineVisiblePath = previousVisiblePath;
     cookie = originalCookie;

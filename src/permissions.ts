@@ -222,12 +222,9 @@ export function endpointAllowed(
  * 一旦被通用或精确 SSH 规则登记，terminal 就会绕过「官方 terminal 与第三方 SSH
  * 共用一个权限开关」的显式网关语义。terminal/list 的关闭态空成功伪装由 gateway
  * 特殊分支提供，不改变这里的 fail-closed 分类。
- * ⚠ `officeToPdf`（@deepseek-ai/dsh-office-to-pdf，0.1.7 官方）同样不进清单：
- * `render(workspaceFileScope, path, …)` 接受绝对/工作区相对路径，scope 由请求头
- * 派生（sessionId + workspaceRoot），作用域隔离依赖 workspaceFiles 实现（0.1.7
- * 只读审计：可能放行作用域外路径），网关侧尚无该命名空间的会话/文件夹守卫，
- * 真实 E2E 也未证明隔离；在此之前子用户 fail-closed（见
- * SUBUSER_BLOCKED_API_NAMESPACES）。主用户不经分类，不受影响。
+ * `officeToPdf` 不进入通用清单：仅 generation/render 的 HTTP POST 由网关显式
+ * 放行。render 复用 workspaceFiles 的会话归属、目录白名单、真实路径与敏感路径
+ * 守卫；Remote 流、命名空间根及未知方法仍拒绝。主用户不受影响。
  * `pluginManager` 仍不在清单内，并由 SUBUSER_BLOCKED_API_NAMESPACES 硬拒绝；
  * Agent Teams 作为已安装扩展可由动态 manifest 自动适配。
  *
@@ -347,10 +344,8 @@ export function isLegacyOfficialApiRoute(pathname: string): boolean {
  * 子用户硬拒绝的 API 命名空间：先于端点登记表判定，任何登记规则都无法覆盖。
  *
  * `pluginManager`（dsh-plugin-manager）的 change/runPnpm 可在 profile 内安装、
- * 卸载、运行第三方包——等于把特权/RCE 面交给子用户；`officeToPdf`
- * （dsh-office-to-pdf，0.1.7）的 `render`
- * 接受绝对/工作区相对路径，且底层 workspaceFiles 可能放行作用域外路径（只读
- * 审计尚未证明其隔离边界）。
+ * 卸载、运行第三方包——等于把特权/RCE 面交给子用户；`officeToPdf` 的已知 HTTP
+ * 预览方法由网关单独校验并放行，不通过通用登记表开放整个命名空间。
  * `dynamicCordisRunner` 涉及动态包定义、host half 生命周期和宿主代码执行，
  * 仍然硬拒。
  * `terminal`（dsh-api-terminal-controller）的 create/write/follow 等
@@ -361,7 +356,7 @@ export function isLegacyOfficialApiRoute(pathname: string): boolean {
  * 未知 terminal 方法仍 fail-closed。terminal 仍不进 OFFICIAL_API_NAMESPACES；
  * 主用户不经分类，官方 terminal 对主用户由网关原样透传。
  *
- * officeToPdf 在作用域隔离经过验证前 fail-closed。productAnalytics、
+ * officeToPdf 的 Remote 流和未知方法仍拒绝。productAnalytics、
  * pluginRegistryProbe 和可选的 speech 是宿主级能力，不属于普通扩展透传面。
  */
 export const SUBUSER_BLOCKED_API_NAMESPACES: ReadonlySet<string> = new Set([
@@ -450,6 +445,20 @@ export const SUBUSER_ALLOWED_ACCOUNT_ENDPOINTS: ReadonlySet<string> = new Set([
   'account/getProfile',
   'account/getBalance',
 ]);
+
+/** Only these unary Office methods have an explicit HTTP authorization path. */
+export const OFFICE_PREVIEW_HTTP_RE = /^\/api\/officeToPdf[.\/](generation|render)$/;
+
+export function officePreviewRequestAllowed(pathname: string, body: unknown): boolean {
+  const method = OFFICE_PREVIEW_HTTP_RE.exec(pathname)?.[1];
+  const args = clientConnectionArgs(body);
+  if (method === undefined || args === null ||
+      (body as Record<string, unknown>).method !== `officeToPdf/${method}`) return false;
+  if (method === 'generation') return Object.keys(args).length === 0;
+  // Scope and path are checked by the shared workspace file guard before forwarding.
+  return Object.keys(args).every(key => ['workspaceFileScopeId', 'path', 'priority'].includes(key)) &&
+    (args.priority === 'foreground' || args.priority === 'background');
+}
 
 /**
  * 该路径是否命中子用户硬拒绝的命名空间或单个端点

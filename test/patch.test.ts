@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { applyRemotePatch, patchStatus, rollbackPatch } from '../src/patch.js';
+import { RC2_NATIVE_SETTINGS } from './fixtures/settings-rc2.js';
 
 /** 构建一个模拟 dsh 根目录（含两个必选补丁目标文件 + 可选 workspace 文件），返回 root 与清理函数 */
 function makeDshRoot(
@@ -254,6 +255,71 @@ test('补丁：alpha.3 settings 使用 remote.$host.isLoopback 时强制 host pe
     assert.equal(patchStatus(root).settingsHostMode, true);
   } finally {
     cleanup();
+  }
+});
+
+function writeRc2Manifests(root: string, version = '0.2.1-rc.2'): void {
+  writeFileSync(path.join(root, 'package.json'), JSON.stringify({ version: '0.2.1-rc.2' }));
+  writeFileSync(path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'package.json'), JSON.stringify({ version }));
+}
+
+test('rc.2 native host settings are recognized without modifying or backing up the client', () => {
+  const { root, cleanup } = makeDshRoot(RC2_NATIVE_SETTINGS);
+  const settings = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib', 'client.js');
+  try {
+    writeRc2Manifests(root);
+    assert.equal(patchStatus(root).settingsHostMode, true);
+    assert.equal(patchStatus(root).settingsMode, 'native');
+    assert.equal(applyRemotePatch(root), 'unchanged');
+    assert.equal(readFileSync(settings, 'utf8'), RC2_NATIVE_SETTINGS);
+    assert.equal(existsSync(settings + '.bak-dshpw'), false);
+    assert.equal(rollbackPatch(root), 'no-backup');
+  } finally {
+    cleanup();
+  }
+});
+
+test('native settings recognition rejects unknown releases, mismatched packages and incomplete contracts', () => {
+  const cases = [
+    { source: RC2_NATIVE_SETTINGS, version: '0.2.1-alpha.2' },
+    { source: RC2_NATIVE_SETTINGS.replace('await this.ctx.remote.settings.describe()', 'await this.ctx.remote.settings.read()') },
+    { source: RC2_NATIVE_SETTINGS.replace('"remote.settings"', '"remote.other"') },
+    { source: RC2_NATIVE_SETTINGS.replace('settings/document-updated', 'settings/unknown') },
+    { source: RC2_NATIVE_SETTINGS.replace('connection/reset', 'connection/unknown') },
+    { source: 'export const label = "host";\n' },
+  ];
+  for (const item of cases) {
+    const { root, cleanup } = makeDshRoot(item.source);
+    try {
+      writeRc2Manifests(root, item.version);
+      assert.equal(patchStatus(root).settingsHostMode, false, item.source);
+      assert.equal(patchStatus(root).settingsMode, 'unsupported');
+    } finally {
+      cleanup();
+    }
+  }
+  const { root, cleanup } = makeDshRoot(RC2_NATIVE_SETTINGS);
+  try {
+    writeRc2Manifests(root);
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ version: '0.2.2-alpha.2' }));
+    assert.equal(patchStatus(root).settingsHostMode, false);
+    assert.equal(patchStatus(root).settingsMode, 'unsupported');
+  } finally {
+    cleanup();
+  }
+});
+
+test('every settings copy must be ready, including a native rc.2 root and a legacy profile copy', () => {
+  const duplicate = makeDshRootWithProfileSettings(RC2_NATIVE_SETTINGS, ALPHA3_SETTINGS_UNPATCHED);
+  try {
+    writeRc2Manifests(duplicate.root);
+    writeFileSync(path.join(duplicate.profile, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'package.json'), JSON.stringify({ version: '0.2.1-rc.2' }));
+    assert.equal(patchStatus(duplicate.root, duplicate.profile).settingsHostMode, false);
+    assert.equal(applyRemotePatch(duplicate.root, duplicate.profile), 'applied');
+    assert.equal(patchStatus(duplicate.root, duplicate.profile).settingsHostMode, true);
+    assert.equal(patchStatus(duplicate.root, duplicate.profile).settingsMode, 'native');
+  } finally {
+    duplicate.cleanup();
   }
 });
 

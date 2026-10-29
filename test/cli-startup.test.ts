@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { RC2_NATIVE_SETTINGS } from './fixtures/settings-rc2.js';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const cli = path.join(projectRoot, 'dist', 'cli.js');
@@ -93,6 +95,65 @@ test('gateway refuses startup when the Cookie bridge is unavailable', () => {
     assert.match(result.stderr, /Cookie bridge/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rc.2 native settings are checked before database creation and public listen', async () => {
+  for (const mode of ['ready', 'unavailable', 'malformed', 'missing-cookie'] as const) {
+    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-rc2-'));
+    const dshRoot = makeDshRoot(root, RC2_NATIVE_SETTINGS, 'authenticatedCookie(baseUrl) {}', '0.2.1-rc.2');
+    writeFileSync(path.join(dshRoot, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'package.json'), JSON.stringify({ version: '0.2.1-rc.2' }));
+    let probeCount = 0;
+    const upstream = createHttpServer((request, response) => {
+      probeCount += 1;
+      assert.equal(request.url, '/api/settings/describe');
+      assert.equal(request.headers.cookie, 'dsh-auth-test=fake-cookie');
+      let body = '';
+      request.on('data', (chunk) => { body += chunk; });
+      request.on('end', () => {
+        const { rpcId } = JSON.parse(body);
+        if (mode === 'unavailable') { response.writeHead(401); response.end(); return; }
+        response.end(mode === 'malformed' ? '{}' : JSON.stringify({
+          type: 'server-response', rpcId, result: { ok: true, value: { writable: true, hasDocument: true, namespaces: [] } },
+        }));
+      });
+    });
+    const blocker = createServer();
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+    const dbPath = path.join(root, 'gateway.db');
+    try {
+      const envFile = writeConfig(root, dshRoot, {
+        MCP_GATEWAY_HOST: '127.0.0.1',
+        MCP_GATEWAY_PORT: String((blocker.address() as AddressInfo).port),
+        MCP_GATEWAY_REDIRECT_PORT: '0',
+        MCP_GATEWAY_UPSTREAM: `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`,
+        MCP_DB_PATH: dbPath,
+      });
+      const child = spawn(process.execPath, [cli, 'serve-gateway'], {
+        cwd: projectRoot,
+        env: { ...process.env, DSH_PASSWORDS_ENV_FILE: envFile, LANG: 'en_US.UTF-8',
+          DSH_UPSTREAM_AUTH_COOKIE: mode === 'missing-cookie' ? '' : 'dsh-auth-test=fake-cookie' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const timer = setTimeout(() => child.kill(), 10_000);
+      let output = '';
+      child.stdout.on('data', (chunk) => { output += chunk; });
+      child.stderr.on('data', (chunk) => { output += chunk; });
+      const exitCode = await new Promise<number | null>((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', resolve);
+      }).finally(() => clearTimeout(timer));
+      assert.equal(exitCode, mode === 'ready' ? 32 : 35, `${mode}: ${output}`);
+      assert.equal(existsSync(dbPath), mode === 'ready', mode);
+      assert.equal(probeCount, mode === 'missing-cookie' ? 0 : 1, mode);
+      assert.doesNotMatch(output, /fake-cookie/);
+    } finally {
+      upstream.closeAllConnections();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

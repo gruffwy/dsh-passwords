@@ -29,6 +29,7 @@ import {
 } from './patch.js';
 import { t, resolveCliLang } from './i18n.js';
 import { UpdateEngine } from './update.js';
+import { nativeSettingsReady } from './settings-readiness.js';
 
 /** CLI 输出语言：LANG / LC_ALL / LC_MESSAGES 以 en 开头则英文，否则中文 */
 const lang = resolveCliLang();
@@ -367,6 +368,12 @@ async function boot() {
     if (status.connectionCookieBridge !== 'patched' && status.connectionCookieBridge !== 'native') {
       console.error('[dsh-passwords] This DSH release requires an authenticated Cookie bridge; refusing to start the public gateway');
       process.exit(33);
+    }
+    if (status.settingsMode === 'native' && !await nativeSettingsReady(
+      config.gateway.upstream, process.env.DSH_UPSTREAM_AUTH_COOKIE?.trim() ?? '',
+    )) {
+      console.error('[dsh-passwords] Native DSH settings.describe is unavailable or returned an unsupported contract; refusing to start the public gateway');
+      process.exit(EXIT_ALPHA3_SETTINGS_UNAVAILABLE);
     }
   } catch (error) {
     console.error(`[dsh-passwords] ${tr('cli.patchSyncFailed')}:`, error);

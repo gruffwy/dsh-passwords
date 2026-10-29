@@ -25,6 +25,7 @@ import { type Duplex, type Transform } from 'node:stream';
 import net from 'node:net';
 import { URL } from 'node:url';
 import zlib from 'node:zlib';
+import { ADMIN_SESSION_COLLECTION_RE, projectAdminSessionCollection, projectAdminSessionRemote } from './admin-session-view.js';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -47,6 +48,8 @@ import {
   OFFICIAL_API_NAMESPACES,
   isSubuserBlockedRemoteEndpoint,
   isSubuserBlockedApiPath,
+  OFFICE_PREVIEW_HTTP_RE,
+  officePreviewRequestAllowed,
   clientConnectionArgs,
   collectAuthorizedSessionIds,
   collectIdPathPairs,
@@ -1023,6 +1026,30 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
           return;
         }
 
+        // 主用户日常列表与授权管理分离：只投影浏览器集合，内部管理资源仍读取完整上游。
+        const adminHiddenSessionIds = reqAs.dshpwIsAdmin === true && req.method === 'POST' && ADMIN_SESSION_COLLECTION_RE.test(proxyPath)
+          ? db.listSubuserViewSessionIds() : [];
+        if (adminHiddenSessionIds.length > 0) {
+          bufferUpstream(upstreamRes, res, raw => {
+            try {
+              const body = decodeUpstreamBody(raw, encoding);
+              const parsed = JSON.parse(body.toString('utf8'));
+              const projected = projectAdminSessionCollection(proxyPath, parsed, new Set(adminHiddenSessionIds));
+              const out = Buffer.from(JSON.stringify(projected), 'utf8');
+              const respHeaders = headersForRewrittenBody(upstreamRes.headers);
+              respHeaders['content-length'] = String(out.length);
+              if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+              if (!res.writableEnded) res.end(out);
+            } catch {
+              // 这里是显示投影，不是管理员权限边界；非 JSON 上游响应沿用原有透传语义。
+              const respHeaders = headersForStreaming(upstreamRes.headers);
+              if (!res.headersSent) res.writeHead(upstreamRes.statusCode ?? 200, respHeaders);
+              if (!res.writableEnded) res.end(raw);
+            }
+          });
+          return;
+        }
+
         // 注：session/history 与 session/page 的响应处理在下方专用分支完成
         // （history：隐藏 Unicode 清洗 + 受限子用户沙盒降级；page：隐藏 Unicode 清洗）。
         // 不要在此处再加宽泛的 history/page 分支——先到先返回会让沙盒降级变成死代码。
@@ -1633,6 +1660,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
                 return;
               }
               if (sessionId !== null && reqAs.dshpwUser !== undefined) {
+                db.recordSessionCreator(sessionId, reqAs.dshpwUser, reqAs.dshpwIsAdmin === true ? 'admin' : 'user');
                 // dsh create/fork 都用 agentDefaultModel.currentSelection() 给新会话
                 // 配模型（fork 不继承源会话模型），所以新会话的初始有效模型就是 Host
                 // 共享默认。这里记为 'default'（而不是把它当成未知）：后续 prompt 时
@@ -2414,7 +2442,9 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
       reqAs.dshpwIsAdmin !== true &&
       req.method === 'POST' &&
       proxyPath === '/open-in-app/open';
-    // ── workspaceFiles 会话作用域 + 目标路径守卫 ──
+    const needsOfficePreviewCheck = reqAs.dshpwPerms !== undefined &&
+      reqAs.dshpwIsAdmin !== true && req.method === 'POST' && OFFICE_PREVIEW_HTTP_RE.test(proxyPath);
+    // ── workspaceFiles / Office render 会话作用域 + 目标路径守卫 ──
     // 上游 read/readAll/readBytes/readRelated/stat 接受绝对路径且明确不做工作区
     // 包含检查，list 只保证在会话根内；请求里的 workspaceFileScopeId 完全由客户端
     // 指定。子用户只有在「该 scope 会话已授权」且「目标路径（含 readBytes 的
@@ -2426,9 +2456,9 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
       reqAs.dshpwPerms !== undefined &&
       reqAs.dshpwIsAdmin !== true &&
       req.method === 'POST' &&
-      WORKSPACE_FILES_RPC_RE.test(proxyPath);
+      (WORKSPACE_FILES_RPC_RE.test(proxyPath) || OFFICE_PREVIEW_HTTP_RE.exec(proxyPath)?.[1] === 'render');
 
-    if (needsFolderCheck || needsSandboxCheck || needsCommandCheck || needsApprovalCheck || needsOwnershipCheck || needsWorkspaceOrderCheck || needsAgentPresetCheck || needsImageAttachmentCheck || needsModelCheck || needsSandboxRunCheck || needsUpstreamHostCheck || needsRemoteEventResultCheck || needsOpenInAppCheck || needsWorkspaceFilesCheck || needsDirectoryListCheck) {
+    if (needsFolderCheck || needsSandboxCheck || needsCommandCheck || needsApprovalCheck || needsOwnershipCheck || needsWorkspaceOrderCheck || needsAgentPresetCheck || needsImageAttachmentCheck || needsModelCheck || needsSandboxRunCheck || needsUpstreamHostCheck || needsRemoteEventResultCheck || needsOpenInAppCheck || needsOfficePreviewCheck || needsWorkspaceFilesCheck || needsDirectoryListCheck) {
       const chunks: Buffer[] = [];
       let size = 0;
       let settled = false;
@@ -2588,6 +2618,12 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
             return;
           }
+        }
+
+        if (needsOfficePreviewCheck && !officePreviewRequestAllowed(proxyPath, bodyObj)) {
+          upstreamReq.destroy();
+          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
+          return;
         }
 
         if (needsWorkspaceFilesCheck) {
@@ -3271,6 +3307,8 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             return;
           }
           reqAs.dshpwCreatedSessionId = createdSessionId;
+          // 在上游发布 workspace upsert 前记录来源，避免子用户新会话短暂闪入主用户侧栏。
+          db.recordSessionCreator(createdSessionId, reqAs.dshpwUser, reqAs.dshpwIsAdmin === true ? 'admin' : 'user');
           forwardBody = Buffer.from(JSON.stringify(bodyObj), 'utf8');
           upstreamReq.setHeader('content-length', String(forwardBody.length));
           pendingCreatedSessionFor(reqAs.dshpwUser).set(reqAs.dshpwCreatedSessionId, {
@@ -3410,6 +3448,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
         const endpointUrl = `${upstream.protocol === 'https:' ? 'wss' : 'ws'}://${upstreamAuthority}${fwdPath}`;
         const upstreamWs = new WebSocket.WebSocket(endpointUrl, upstreamWsOptions());
         const active = new Map<string, RemoteMuxUserStreamState | null>();
+        const adminViewStreams = new Map<string, string>();
         const diagnostics = createRemoteMuxDiagnosticsSession(`mux-${Date.now().toString(36)}`);
         // 记录已经排队/发送 open 的逻辑流。若网关随后因首帧授权校验拒绝它，
         // rejectLogicalStream 必须向上游补 cancel，避免宿主侧订阅脱离 active 后泄漏。
@@ -4088,6 +4127,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
               }
             } else {
               active.set(frame.streamId, null);
+              if (frame.endpoint === 'workspace/follow' || frame.endpoint === 'session/control') adminViewStreams.set(frame.streamId, frame.endpoint);
             }
           } else if (!active.has(frame.streamId)) {
             return;
@@ -4134,6 +4174,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
             upstreamForwardedStreamIds.delete(frame.streamId);
             upstreamForwardedAt.delete(frame.streamId);
             active.delete(frame.streamId);
+            adminViewStreams.delete(frame.streamId);
           }
         });
         client.on('close', () => {
@@ -4225,14 +4266,21 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
               flushPendingSessionStreams();
             }
           } else if (frame.type === 'item') {
-            // 未过滤流（管理员，或官方未过滤端点）的 item 仍是业务数据帧：走 item 通道，
-            // 容量拒绝只隔离该逻辑流；只有 open/end/error/cancel 等控制帧才走 carrier 级通道。
-            if (!sendClientItemFrame(frame.streamId, JSON.stringify(frame))) return;
+            const endpoint = adminViewStreams.get(frame.streamId);
+            if (endpoint !== undefined) {
+              const value = projectAdminSessionRemote(endpoint, frame.value, new Set(db.listSubuserViewSessionIds()));
+              if (value === null) return;
+              if (!sendClientItemFrame(frame.streamId, JSON.stringify({ ...frame, value }))) return;
+            } else {
+              // 未过滤流的 item 仍走业务数据通道，保持原有背压处理。
+              if (!sendClientItemFrame(frame.streamId, JSON.stringify(frame))) return;
+            }
           } else {
             if (!sendClientControlFrame(JSON.stringify(frame))) return;
           }
           if (frame.type === 'end' || frame.type === 'error') {
             active.delete(frame.streamId);
+            adminViewStreams.delete(frame.streamId);
             upstreamForwardedStreamIds.delete(frame.streamId);
             upstreamForwardedAt.delete(frame.streamId);
           }

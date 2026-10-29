@@ -163,6 +163,7 @@ import {
   folderAllowed,
   normalizePath,
   isSubuserBlockedApiPath,
+  OFFICE_PREVIEW_HTTP_RE,
   classifySubuserPath,
   type DynamicPluginManifest,
   OFFICIAL_API_NAMESPACES,
@@ -1419,6 +1420,7 @@ export function createGatewayServer(
   const registryAuthorizedSockets = new Set<Duplex>();
   // 不泄露框架信息
   app.disable('x-powered-by');
+  db.initializeAdminSessionView();
   // 仅解析 /gateway 表单请求；代理请求的 body 必须原样透传给上游
   // （全局 express.json/urlencoded 会消费掉请求流，导致上游收到空 body）
   app.use('/gateway', express.urlencoded({ extended: false }));
@@ -4018,6 +4020,7 @@ export function createGatewayServer(
         // 登记规则绕过这里的显式授权分支；本分支是唯一允许子用户进入官方
         // terminal 的入口。
         const officialTerminalHttp = req.method === 'POST' && OFFICIAL_TERMINAL_HTTP_RE.test(requestPath);
+        const officialOfficePreviewHttp = req.method === 'POST' && OFFICE_PREVIEW_HTTP_RE.test(requestPath);
         const terminalStub = officialTerminalHttp ? TERMINAL_STUB_RE.exec(requestPath) : null;
         // owner: 规则优先于 SSH 总开关：真实宿主能力始终拒绝；四个无能力 UX 桩
         // 无论 allowSsh 状态都返回固定本地响应，保持客户端恢复流程稳定。
@@ -4026,10 +4029,9 @@ export function createGatewayServer(
           return;
         }
         // 子用户硬拒绝的敏感命名空间/端点（pluginManager / settings 写 / 凭据等）：
-        // 先于 SSH 授权分支判定，任何登记规则都不能放行。官方 terminal 是唯一例外——
-        // 它命中硬拒绝分类，但由下方显式 allowSsh 分支决定能否透传；未知 terminal
-        // 方法（不匹配 OFFICIAL_TERMINAL_HTTP_RE）仍落到这里被拒绝。
-        if (isSubuserBlockedApiPath(requestPath) && !officialTerminalHttp && terminalStub === null) {
+        // 先于 SSH 授权分支判定，登记规则不能放行。terminal 由 allowSsh 控制；
+        // Office 的两个 HTTP 方法由 proxy 校验信封，render 再校验会话和文件路径。
+        if (isSubuserBlockedApiPath(requestPath) && !officialTerminalHttp && !officialOfficePreviewHttp && terminalStub === null) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
           return;
         }
@@ -4041,7 +4043,7 @@ export function createGatewayServer(
           return;
         }
         const hasLegacySshRule = endpointAllowed(requestPath, endpointRules, { capability: 'ssh' });
-        if (hasLegacySshRule && pathClass !== 'ssh' && !officialTerminalHttp) {
+        if (hasLegacySshRule && pathClass !== 'ssh' && !officialTerminalHttp && !officialOfficePreviewHttp) {
           // 传统 SSH 表中的路径仍受 transport 前缀约束；普通未登记插件
           // 不进入该分支，因此不会被传统表逻辑误伤。
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));

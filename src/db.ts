@@ -386,6 +386,13 @@ CREATE TABLE IF NOT EXISTS user_session_grants (
   PRIMARY KEY (user_id, session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_user_session_grants_session ON user_session_grants(session_id);
+-- 日常会话视图的来源记录；与可随时增删的授权分离，删除账号后仍保留历史来源。
+CREATE TABLE IF NOT EXISTS session_view_owners (
+  session_id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+  source TEXT NOT NULL CHECK (source IN ('creator', 'legacy-grant'))
+);
 -- 删除联动失败后的清理意图（跨重启的重试凭证）：只在目录已物理删除且 DB 清理
 -- 事务回滚时写入；记录受信的 realpath/归一化根 + 受影响会话 + 操作者。重试准入
 -- 只认与记录根同一路径的请求（共用 pathWithinDeletedTree/samePathForMatch），
@@ -1653,6 +1660,32 @@ export class Database {
   }
 
   // ── 子用户显式会话授权 ──────────────────────────
+  /** 仅影响主用户日常显示；旧授权来源只初始化一次，不改变任何会话授权。 */
+  initializeAdminSessionView(): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.getSetting('admin_session_view_seeded') !== '1') {
+        this.db.exec(`INSERT OR IGNORE INTO session_view_owners (session_id, user_id, role, source)
+          SELECT g.session_id, MIN(g.user_id), 'user', 'legacy-grant'
+          FROM user_session_grants g JOIN users u ON u.id = g.user_id
+          WHERE u.role = 'user' GROUP BY g.session_id`);
+        this.setSetting('admin_session_view_seeded', '1');
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  recordSessionCreator(sessionId: string, userId: number, role: 'admin' | 'user'): void {
+    if (!sessionId || sessionId.length > 200) return;
+    this.stmt('INSERT OR IGNORE INTO session_view_owners (session_id, user_id, role, source) VALUES (?, ?, ?, ?)')
+      .run(sessionId, userId, role, 'creator');
+  }
+
+  listSubuserViewSessionIds(): string[] {
+    return (this.stmt("SELECT session_id FROM session_view_owners WHERE role = 'user'").all() as { session_id: string }[])
+      .map(row => row.session_id);
+  }
+
   /** 读取用户已被管理员明确授予的会话 ID；空数组表示未授予任何会话。 */
   listUserSessionGrants(userId: number): string[] {
     return (

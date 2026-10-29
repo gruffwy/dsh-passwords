@@ -23,6 +23,7 @@ import { TokenReporter } from './token';
 import { startPickerDelete } from './picker-delete';
 import { startFileDownload } from './file-download';
 import { startSubuserMenuVisibility } from './sidebar-menu';
+import { startPersonalWorkspace } from './personal-workspace';
 import { zh, en } from './locales';
 
 /** 卡片样式：全部使用 dsh 设计令牌（--dsw-alias-*），颜色/主题与官方 PluginCard 完全一致 */
@@ -176,6 +177,7 @@ export const inject = ['slots', 'locale'] as const;
 
 export function apply(ctx: ClientContext): void {
   ctx.effect(startSubuserMenuVisibility, 'dsh-passwords: subuser menu visibility');
+  ctx.effect(() => startPersonalWorkspace(ctx), 'dsh-passwords: personal workspace selection');
   // 目录选择器删除按钮（仅主用户）：角色由模块内部探测，非主用户零副作用；
   // 授权由网关 requireAdmin 兜底。这里 fire-and-forget，不阻塞插件加载。
   startPickerDelete();

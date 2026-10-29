@@ -12,6 +12,7 @@ import { createElement as h, useEffect, useRef, useState, type ReactNode } from 
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots';
 import { publishChatEntryChanged } from './events';
 import { api } from './api';
+import { workspacePathKey } from './workspace-path';
 
 export interface UserInfo {
   id: number;
@@ -1143,18 +1144,21 @@ export function DshPasswordsCard(props: DshpwCardProps) {
 
   const enabledFolderSet = (draft: PermDraft): Set<string> => {
     if (draft.folders.includes('__deny__')) return new Set();
-    if (draft.folders.length === 0) return new Set(workspaces.map((workspace) => workspace.path));
-    return new Set(draft.folders);
+    if (draft.folders.length === 0) return new Set(workspaces.map((workspace) => workspacePathKey(workspace.path)));
+    return new Set(draft.folders.map(workspacePathKey));
   };
 
   const toggleWorkspace = (userId: number, workspace: WorkspaceInfo, enabled: boolean) => {
     const draft = permDrafts[userId];
     if (!draft) return;
-    const enabledFolders = enabledFolderSet(draft);
-    if (enabled) enabledFolders.add(workspace.path);
-    else enabledFolders.delete(workspace.path);
+    const enabledFolders = draft.folders.includes('__deny__') ? []
+      : draft.folders.length === 0 ? workspaces.map((entry) => entry.path) : [...draft.folders];
+    const matches = (entry: string) => workspacePathKey(entry) === workspacePathKey(workspace.path);
+    const next = enabled
+      ? enabledFolders.some(matches) ? enabledFolders : [...enabledFolders, workspace.path]
+      : enabledFolders.filter((entry) => !matches(entry));
     setDraft(userId, {
-      folders: enabledFolders.size === 0 ? ['__deny__'] : [...enabledFolders],
+      folders: next.length === 0 ? ['__deny__'] : next,
     });
   };
 
@@ -2011,7 +2015,7 @@ export function DshPasswordsCard(props: DshpwCardProps) {
                     'div',
                     { className: 'dshpw-workspaces' },
                     ...workspaces.map((workspace) => {
-                      const enabled = enabledFolderSet(d).has(workspace.path);
+                      const enabled = enabledFolderSet(d).has(workspacePathKey(workspace.path));
                       return h(
                         'div',
                         { className: 'dshpw-workspace', key: workspace.path },

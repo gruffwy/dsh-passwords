@@ -1808,6 +1808,33 @@ export class Database {
   }
 
   // ── 子用户创建的工作区 ─────────────────────────
+  /** 首次开通仅追加个人目录；共享目录始终由管理员单独授权，补建不恢复已撤销权限。 */
+  provisionPersonalWorkspace(userId: number, workspace: { path: string; workspaceId: string }): void {
+    const key = `personal_workspace:${userId}`;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.getUserListRowById(userId)?.role !== 'user') throw new Error('子用户已不存在，未分配个人工作区');
+      const existing = this.getSetting(key);
+      if (existing === null) {
+        const permissions = this.getPermissions(userId);
+        if (permissions === null) throw new Error('子用户权限尚未初始化，未授予目录');
+        const folders = [...new Set([
+          ...permissions.allowed_folders.filter((entry) => entry !== '__deny__'),
+          normalizePath(workspace.path),
+        ])];
+        this.stmt(`UPDATE user_permissions SET allowed_folders = ?,
+          sandbox_mode = CASE WHEN sandbox_mode = 'read-only' THEN 'read-only' ELSE 'workspace-write' END,
+          updated_at = datetime('now') WHERE user_id = ?`).run(JSON.stringify(folders), userId);
+      }
+      this.addUserWorkspace(userId, workspace.path);
+      this.setSetting(key, JSON.stringify(workspace));
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   addUserWorkspace(userId: number, workspacePath: string): void {
     this.stmt(
       'INSERT OR IGNORE INTO user_workspaces (user_id, path) VALUES (?, ?)',

@@ -41,6 +41,7 @@ import { AuthService, AuthError, assertNoSqlInjection, type AuthedUser, type Req
 import { findDshRoot, patchStatus } from './patch.js';
 import { updateApplyHttpStatus } from './update.js';
 import { OFFICIAL_API_NAMESPACES, SUBUSER_BLOCKED_API_NAMESPACES, isSubuserBlockedRemoteEndpoint } from './permissions.js';
+import { PersonalWorkspaces, getPersonalWorkspace, loadPersonalWorkspaceConfig, personalWorkspaceSandboxMode, type PersonalWorkspaceRegistry } from './personal-workspaces.js';
 
 /** 稳定 cordis 插件名（insert 进 cordis.yml 时用同一个名字） */
 export const name = 'dsh-passwords';
@@ -1428,11 +1429,18 @@ export function apply(ctx: Context): void {
   let lastPatchReload = 0;
   let db: Database | null = null;
   let auth: AuthService | null = null;
+  let personalWorkspaces: PersonalWorkspaces | null = null;
   if (configured) {
     try {
       db = new Database(cfg.dbPath, createFieldCrypto(cfg.dbEncKey, cfg.setupKey));
       db.init();
       auth = new AuthService(cfg, db);
+      const personalConfig = loadPersonalWorkspaceConfig(path.join(path.dirname(cfg.dbPath), 'personal-workspaces.json'));
+      if (personalConfig !== null) {
+        personalWorkspaces = new PersonalWorkspaces(personalConfig, db, () =>
+          ctx.get('workspaceRegistry') as unknown as PersonalWorkspaceRegistry | undefined,
+          path.join(path.dirname(cfg.dbPath), 'workspace-acl-backups'));
+      }
     } catch (error) {
       console.error('[dsh-passwords] 网关数据库初始化失败:', error);
       db = null;
@@ -1568,6 +1576,9 @@ export function apply(ctx: Context): void {
         writeJson(res, 200, {
           ok: true,
           me: { username: caller.username, role: caller.role },
+          personalWorkspacesEnabled: personalWorkspaces !== null,
+          personalWorkspace: caller.role === 'user' && personalWorkspaces !== null
+            ? getPersonalWorkspace(db!, caller.userId) : null,
           users,
           // 聊天入口为按用户同步的显示偏好：未设置默认开启；用户跨设备登录同一账号时一致。
           chatEnabled: db!.getSetting(`chat_enabled:${String(caller.userId)}`) !== '0',
@@ -1650,10 +1661,45 @@ export function apply(ctx: Context): void {
           const password = typeof body.password === 'string' ? body.password : '';
           assertNoSqlInjection(username, 'username');
           await auth!.addSubUser(caller, username, password, metaOf(req));
+          if (personalWorkspaces !== null) {
+            const user = db!.getUserListRowById(db!.getUserByUsername(username.trim())!.id)!;
+            try {
+              await personalWorkspaces.ensure(user);
+            } catch (error) {
+              console.error('[dsh-passwords] 子用户个人工作区开通失败:', user.id, error);
+              writeJson(res, 503, { ok: false, code: 'PERSONAL_WORKSPACE_FAILED', error: '账号已创建，个人工作区尚未开通。请由管理员补建，不要重复创建账号。' });
+              return;
+            }
+          }
           writeJson(res, 200, { ok: true });
         } catch (error) {
           failJson(res, error);
         }
+      },
+    },
+    {
+      kind: 'exact',
+      path: '/api/dsh-passwords/personal-workspaces/repair',
+      handler: async (req, res) => {
+        const caller = guard(req, res);
+        if (!caller) return;
+        if (!requireMethod(req, res, 'POST')) return;
+        if (caller.role !== 'admin') { writeJson(res, 403, { ok: false, error: '仅主用户可补建个人工作区' }); return; }
+        if (personalWorkspaces === null) { writeJson(res, 409, { ok: false, error: '尚未启用个人工作区自动开通' }); return; }
+        try {
+          const body = await readJsonBody(req);
+          if (body.userId !== undefined && (!Number.isSafeInteger(body.userId) || Number(body.userId) < 1)) {
+            writeJson(res, 400, { ok: false, error: 'userId 无效' }); return;
+          }
+          const users = db!.listUsers().filter((user) => user.role === 'user' && (body.userId === undefined || user.id === body.userId));
+          if (users.length === 0 && body.userId !== undefined) { writeJson(res, 404, { ok: false, error: '子用户不存在' }); return; }
+          const results = [];
+          for (const user of users) {
+            try { results.push({ userId: user.id, ok: true, workspace: await personalWorkspaces.ensure(user) }); }
+            catch (error) { results.push({ userId: user.id, ok: false, error: error instanceof Error ? error.message : '补建失败' }); }
+          }
+          writeJson(res, results.every((result) => result.ok) ? 200 : 503, { ok: results.every((result) => result.ok), results });
+        } catch (error) { failJson(res, error); }
       },
     },
     {
@@ -1960,7 +2006,9 @@ export function apply(ctx: Context): void {
               writeJson(res, 404, { ok: false, error: 'no session' });
               return;
             }
-            session.append('sandbox/mode', { mode });
+            const cwd = (session as unknown as { header?: { cwd?: string } }).header?.cwd;
+            const effectiveMode = personalWorkspaceSandboxMode(personalWorkspaces?.config ?? null, cwd, mode);
+            session.append('sandbox/mode', { mode: effectiveMode });
             writeJson(res, 200, { ok: true });
           })
           .catch((error) => failJson(res, error))
@@ -1979,6 +2027,35 @@ export function apply(ctx: Context): void {
     },
     'dsh-passwords: user management routes',
   );
+
+  // 只补建缺失资源；目录和归属使用固定 ID，不依赖用户名，不迁移或删除旧文件。
+  if (personalWorkspaces !== null && db !== null) {
+    ctx.effect(() => {
+      let disposed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const run = async (attempt: number): Promise<void> => {
+        if (disposed) return;
+        try {
+          const registry = ctx.get('workspaceRegistry') as unknown as PersonalWorkspaceRegistry | undefined;
+          if (registry === undefined) throw new Error('工作区服务尚未就绪');
+          const failed: string[] = [];
+          for (const user of db!.listUsers().filter((entry) => entry.role === 'user')) {
+            if (disposed) return;
+            try {
+              const workspace = await personalWorkspaces!.ensure(user);
+              if (attempt === 0) console.info(`[dsh-passwords] 个人工作区就绪: u_${user.id} ${workspace.path}`);
+            } catch (error) { failed.push(`u_${user.id}: ${error instanceof Error ? error.message : '补建失败'}`); }
+          }
+          if (failed.length > 0) throw new Error(failed.join('; '));
+        } catch (error) {
+          if (attempt < 20 && !disposed) timer = setTimeout(() => void run(attempt + 1), 1_000);
+          else console.error('[dsh-passwords] 个人工作区补建失败，重启后可重试:', error);
+        }
+      };
+      timer = setTimeout(() => void run(0), 0);
+      return () => { disposed = true; if (timer !== undefined) clearTimeout(timer); };
+    }, 'dsh-passwords: personal workspaces');
+  }
 
   // 自动拉起密码门（.env 未配置时跳过，避免在未安装的环境里误启）
   if (configured) {

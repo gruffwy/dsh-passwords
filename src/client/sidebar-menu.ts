@@ -1,6 +1,6 @@
 import { api } from './api';
 
-const PERSONAL_SECTIONS = new Set(['密码门', 'Password Gate']);
+const PERSONAL_SECTIONS = new Set(['密码门', 'Password Gate', 'OpenCode调色板', 'OpenCode Palette']);
 const SETTINGS_NAV = 'nav:has([data-slot="settings.header"])';
 const CSS = `
 html[data-dshpw-subuser-menus] .dcu-sb-pinned-section,
